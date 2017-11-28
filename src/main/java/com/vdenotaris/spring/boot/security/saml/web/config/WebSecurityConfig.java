@@ -28,6 +28,7 @@ import javax.annotation.PreDestroy;
 
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
+import org.apache.commons.httpclient.params.HttpClientParams;
 import org.apache.commons.httpclient.protocol.Protocol;
 import org.apache.commons.httpclient.protocol.ProtocolSocketFactory;
 import org.apache.velocity.app.VelocityEngine;
@@ -110,6 +111,11 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
  
 	private Timer backgroundTaskTimer;
 	private MultiThreadedHttpConnectionManager multiThreadedHttpConnectionManager;
+	private final int httpTimeOut = 5000;
+	private final String spEntityName = "com:osingh:spring:sp";
+	/* TODO: Here the URL is https based but here it has to be specified as http else it is not accessable.
+	 * Check how it is with EO. Fix it if required.	*/ 
+	private final String ssoCircleIdpMetadataURL = "http://idp.ssocircle.com/idp-meta.xml";
 	
 	@PostConstruct
 	public void init() {
@@ -144,10 +150,21 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return new ParserPoolHolder();
     }
  
-    // Bindings, encoders and decoders used for creating and parsing messages
+    // Creates client that would be required for HTTP based communication.
     @Bean
     public HttpClient httpClient() {
-        return new HttpClient(this.multiThreadedHttpConnectionManager);
+    	// OSinghCodeChanges - Start
+    	HttpClientParams clientParams = new HttpClientParams();
+        clientParams.setConnectionManagerTimeout(this.httpTimeOut);
+        clientParams.setSoTimeout(this.httpTimeOut);
+        
+        this.multiThreadedHttpConnectionManager.getParams().setConnectionTimeout(this.httpTimeOut);
+        
+        HttpClient httpClient = new HttpClient(this.multiThreadedHttpConnectionManager);
+        httpClient.setParams(clientParams);        
+        
+    	return httpClient;
+    	// OSinghCodeChanges - End
     }
  
     // SAML Authentication Provider responsible for validating of received SAML
@@ -259,7 +276,7 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return webSSOProfileOptions;
     }
  
-    // Entry point to initialize authentication, default values taken from
+    // Entry point to initialize SAML authentication, default values taken from
     // properties file
     @Bean
     public SAMLEntryPoint samlEntryPoint() {
@@ -268,7 +285,8 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return samlEntryPoint;
     }
     
-    // Setup advanced info about metadata
+    // Setup advanced info about meta data.
+    // To be used by both SP and IDP meta data.
     @Bean
     public ExtendedMetadata extendedMetadata() {
     	ExtendedMetadata extendedMetadata = new ExtendedMetadata();
@@ -286,38 +304,36 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return idpDiscovery;
     }
     
-	@Bean
-	@Qualifier("idp-ssocircle")
-	public ExtendedMetadataDelegate ssoCircleExtendedMetadataProvider()
+	// Provides meta data for identity providers.
+    @Bean
+	public ExtendedMetadataDelegate ssoCircleIdpMetadataProvider()
 			throws MetadataProviderException {
-		String idpSSOCircleMetadataURL = "https://idp.ssocircle.com/idp-meta.xml";
 		HTTPMetadataProvider httpMetadataProvider = new HTTPMetadataProvider(
-				this.backgroundTaskTimer, httpClient(), idpSSOCircleMetadataURL);
+				this.backgroundTaskTimer, httpClient(), ssoCircleIdpMetadataURL);
 		httpMetadataProvider.setParserPool(parserPool());
 		ExtendedMetadataDelegate extendedMetadataDelegate = 
 				new ExtendedMetadataDelegate(httpMetadataProvider, extendedMetadata());
 		extendedMetadataDelegate.setMetadataTrustCheck(true);
 		extendedMetadataDelegate.setMetadataRequireSignature(false);
-		backgroundTaskTimer.purge();
+		this.backgroundTaskTimer.purge();
 		return extendedMetadataDelegate;
 	}
  
-    // IDP Metadata configuration - paths to metadata of IDPs in circle of trust
-    // is here
-    // Do no forget to call iniitalize method on providers
+    // Configures all pre-generated SP meta data and all IDP meta data. 
     @Bean
     @Qualifier("metadata")
     public CachingMetadataManager metadata() throws MetadataProviderException {
         List<MetadataProvider> providers = new ArrayList<MetadataProvider>();
-        providers.add(ssoCircleExtendedMetadataProvider());
+        providers.add(ssoCircleIdpMetadataProvider());
         return new CachingMetadataManager(providers);
     }
  
-    // Filter automatically generates default SP metadata
+    // Generates default SP meta data
     @Bean
     public MetadataGenerator metadataGenerator() {
         MetadataGenerator metadataGenerator = new MetadataGenerator();
-        metadataGenerator.setEntityId("com:vdenotaris:spring:sp");
+        // Unique ID of SP with which it is registered at IDP.
+        metadataGenerator.setEntityId(spEntityName);
         metadataGenerator.setExtendedMetadata(extendedMetadata());
         metadataGenerator.setIncludeDiscoveryExtension(false);
         metadataGenerator.setKeyManager(keyManager()); 
@@ -331,7 +347,7 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return new MetadataDisplayFilter();
     }
      
-    // Handler deciding where to redirect user after successful login
+    // SAML Authentication success handler
     @Bean
     public SavedRequestAwareAuthenticationSuccessHandler successRedirectHandler() {
         SavedRequestAwareAuthenticationSuccessHandler successRedirectHandler =
@@ -340,7 +356,7 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
         return successRedirectHandler;
     }
     
-	// Handler deciding where to redirect user after failed login
+	// SAML Authentication failure handler
     @Bean
     public SimpleUrlAuthenticationFailureHandler authenticationFailureHandler() {
     	SimpleUrlAuthenticationFailureHandler failureHandler =
@@ -371,7 +387,7 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
      
     @Bean
     public MetadataGeneratorFilter metadataGeneratorFilter() {
-        return new MetadataGeneratorFilter(metadataGenerator());
+    	return new MetadataGeneratorFilter(metadataGenerator());    	
     }
      
     // Handler for successful logout
@@ -509,15 +525,15 @@ public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
     protected void configure(HttpSecurity http) throws Exception {
         http
             .httpBasic()
-                .authenticationEntryPoint(samlEntryPoint());
+                .authenticationEntryPoint(samlEntryPoint()); // Define entry point for HTTP Basic authentication.
         http
         	.csrf()
-        		.disable();
+        		.disable(); // TODO: This is disabling the handling of Cross-Site-Request-Forgery. Review this.  
         http
-            .addFilterBefore(metadataGeneratorFilter(), ChannelProcessingFilter.class)
-            .addFilterAfter(samlFilter(), BasicAuthenticationFilter.class);
+            .addFilterBefore(metadataGeneratorFilter(), ChannelProcessingFilter.class) // To automatically generate SP meta data on first call.
+            .addFilterAfter(samlFilter(), BasicAuthenticationFilter.class); // Apply this filter on HTTP Basic Authentication request. 
         http        
-            .authorizeRequests()
+            .authorizeRequests() // Set authorization permission for different URL patterns.
             .antMatchers("/").permitAll()
             .antMatchers("/error").permitAll()
             .antMatchers("/saml/**").permitAll()
